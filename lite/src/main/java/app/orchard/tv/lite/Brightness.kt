@@ -32,6 +32,11 @@ object Brightness {
     fun level(context: Context): Float? {
         val r = context.contentResolver
         if (installed(context, "com.tcl.settings")) TclPicture.backlight(context)?.let { return it / 100f }
+        // Letv/MStar (S40 Air and other MStar TVs, Android 4.3): its 1.0 TvPictureManager drives the
+        // panel's backlight and answers the very number the picture menu shows. The 2.0
+        // com.mstar.android.tvapi.common.PictureManager is the wrong one: its setBacklight moves the
+        // PQ "brightness" and its getBacklight reads back an internal register (142/255/310).
+        MstarPicture.backlight()?.let { return it / 100f }
         return when {
             usesXiaomiBacklight(context) -> {
                 if (context.checkCallingOrSelfPermission("android.permission.WRITE_SECURE_SETTINGS") != PackageManager.PERMISSION_GRANTED) return null
@@ -53,6 +58,8 @@ object Brightness {
         val percent = Math.round(current * 100)
         val next = (if (direction > 0) (percent / 5 + 1) * 5 else ((percent + 4) / 5 - 1) * 5).coerceIn(1, 100)
         val r = context.contentResolver
+        // Letv/MStar first: its backlight is the same 0-100 the TV's picture menu shows.
+        if (MstarPicture.backlight() != null && MstarPicture.setBacklight(next)) return next / 100f
         if (!installed(context, "com.tcl.settings") && !usesXiaomiBacklight(context) && MitvPanel.usable(context)) {
             runCatching {
                 val from = mitvLevel ?: MitvPanel.level(context) ?: storedLevel(context) ?: percent
@@ -114,5 +121,35 @@ private object TclPicture {
     fun setBacklight(context: Context, percent: Int) {
         val pm = manager(context) ?: return
         pm.javaClass.getMethod("setGraphicBacklight", Int::class.javaPrimitiveType).invoke(pm, percent.coerceIn(1, 100))
+    }
+}
+/**
+ * MStar's picture manager (Letv S40 Air and other MStar TVs): the 1.0 `com.mstar.android.tv.
+ * TvPictureManager` is the one the TV's own picture menu drives — `getBacklight` reads back the
+ * number that menu shows (100 on a TV set to 100), and `setBacklight` returns true and reads back
+ * what was just written. The 2.0 `com.mstar.android.tvapi.common.PictureManager` looks similar but
+ * is the wrong one: its `setBacklight` moves the PQ "brightness" and its `getBacklight` answers an
+ * internal register, not the level.
+ *
+ * Reached by reflection and only when the class is there: on every other TV `backlight()` returns
+ * null and nothing changes.
+ */
+private object MstarPicture {
+    private fun manager(): Any? = runCatching {
+        Class.forName("com.mstar.android.tv.TvPictureManager").getMethod("getInstance").invoke(null)
+    }.getOrNull()
+
+    fun backlight(): Int? {
+        val pm = manager() ?: return null
+        return runCatching { pm.javaClass.getMethod("getBacklight").invoke(pm) as Int }
+            .getOrNull()?.takeIf { it in 1..100 }
+    }
+
+    fun setBacklight(percent: Int): Boolean {
+        val pm = manager() ?: return false
+        return runCatching {
+            pm.javaClass.getMethod("setBacklight", Int::class.javaPrimitiveType)
+                .invoke(pm, percent.coerceIn(1, 100)) as Boolean
+        }.getOrDefault(false)
     }
 }
