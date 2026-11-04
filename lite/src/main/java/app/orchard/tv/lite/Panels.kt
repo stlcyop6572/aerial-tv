@@ -147,8 +147,14 @@ class ControlCenter(
     private fun volumeRow(): SliderRow = SliderRow(
         context,
         glyph = { if (it <= 0f) Glyph.SpeakerMuted else Glyph.Speaker },
-        read = { audio.getStreamVolume(AudioManager.STREAM_MUSIC) to audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC) },
-        write = { audio.setStreamVolume(AudioManager.STREAM_MUSIC, it, AudioManager.FLAG_PLAY_SOUND) },
+        // The TV's own level where it has one (Letv's eUI sets), else Android's music stream.
+        read = {
+            MstarAudio.volume(context)?.let { v -> v to 100 }
+                ?: (audio.getStreamVolume(AudioManager.STREAM_MUSIC) to audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC))
+        },
+        write = { to ->
+            if (!MstarAudio.setVolume(context, to)) audio.setStreamVolume(AudioManager.STREAM_MUSIC, to, AudioManager.FLAG_PLAY_SOUND)
+        },
         shown = { v, _ -> if (v == 0) context.getString(R.string.cc_muted) else v.toString() },
     )
 
@@ -829,5 +835,69 @@ class HiddenApps(context: Context, close: () -> Unit, apps: List<AppEntry>, unhi
             row(r)
         }
         focusFirst()
+    }
+}
+/**
+ * MStar's audio on Letv's eUI sets (S40 Air and other MStar TVs, Android 4.3): the speaker level
+ * lives in tvos, not in Android's streams. On the S40 Air `AudioManager` answers 15 on a TV that is
+ * at 40, and setting STREAM_MUSIC changes nothing at all. `E_VOL_SOURCE_SPEAKER_OUT` is the source
+ * the set's own volume keys drive, so reading and writing it matches what the TV is actually playing.
+ *
+ * The on-screen volume bar reads a separate `Volume` row in the TV's settings database, which only
+ * TvService and the remote can write — no Java API exposes it (TvAudioManager's setters, TvManager's
+ * managers, DatabaseManager and FactoryManager were all tried), so the number on screen may not
+ * follow this slider. The sound does.
+ *
+ * Reached by reflection, and only on the Letv eUI firmwares that have the class: elsewhere
+ * `volume()` returns null and `setVolume` returns false, so the AudioManager path above stays in
+ * charge. Other makes' MStar TVs keep Android's streams, which do drive their speakers.
+ */
+private object MstarAudio {
+    /**
+     * Whether this is a Letv eUI set, by its own settings app rather than its model name (these
+     * boards report MStar as the manufacturer): only there does the AudioManager leave the speaker
+     * to tvos, which is the whole reason to prefer it.
+     */
+    private fun letv(context: Context): Boolean =
+        runCatching { context.packageManager.getPackageInfo("com.stv.t2.globalsetting", 0) }.isSuccess
+
+    private fun sources(): List<Any> {
+        val e = runCatching {
+            Class.forName("com.mstar.android.tvapi.common.vo.EnumAudioVolumeSourceType")
+        }.getOrNull() ?: return emptyList()
+        return listOf("E_VOL_SOURCE_SPEAKER_OUT", "E_VOL_SOURCE_HP_OUT")
+            .mapNotNull { name -> runCatching { e.getField(name).get(null) }.getOrNull() }
+    }
+
+    private fun manager(): Any? = runCatching {
+        val tv = Class.forName("com.mstar.android.tvapi.common.TvManager").getMethod("getInstance").invoke(null)
+        tv.javaClass.getMethod("getAudioManager").invoke(tv)
+    }.getOrNull()
+
+    fun volume(context: Context): Int? {
+        if (!letv(context)) return null
+        val am = manager() ?: return null
+        val src = sources().firstOrNull() ?: return null
+        return runCatching {
+            (am.javaClass.getMethod("getAudioVolume", src.javaClass).invoke(am, src) as Byte).toInt()
+        }.getOrNull()?.takeIf { it in 0..100 }
+    }
+
+    /** True when the TV took it; false anywhere else, so the caller falls back. */
+    fun setVolume(context: Context, percent: Int): Boolean {
+        if (!letv(context)) return false
+        val am = manager() ?: return false
+        val srcs = sources()
+        if (srcs.isEmpty()) return false
+        val v = percent.coerceIn(0, 100)
+        var ok = false
+        for (src in srcs) {
+            runCatching {
+                am.javaClass.getMethod("setAudioVolume", src.javaClass, Byte::class.javaPrimitiveType)
+                    .invoke(am, src, v.toByte())
+                ok = true
+            }
+        }
+        return ok
     }
 }
